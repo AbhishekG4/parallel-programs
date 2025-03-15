@@ -1,5 +1,5 @@
 // Engineer: Abhishek Gautam
-// Last Updated: 02-22-2025
+// Last Updated: 03-15-2025
 
 // Problem/Functionality: This is a Kernel to perform a reduction on an input
 //                        array. In this case we are simply going to sum all
@@ -29,29 +29,31 @@
 
 // =============================================================================
 
-#include <stdio.h>
-#include <stdlib.h>
+#include <limits.h>
 
-#define N_ (64 * 1024 * 1024)
-#define MAX_THREADS 512
+#include <iostream>
+#include <numeric>
+#include <vector>
 
-typedef double dtype;
+constexpr size_t N_ = 64 * 1024 * 1024;
+constexpr int MAX_THREADS = 512;
 
-int nxtPow2(int x) {  // Obtains the next greatest power of 2 if not already a
-                      // power of 2
-  x--;
-  x |= x >> 1;
-  x |= x >> 2;
-  x |= x >> 4;
-  x |= x >> 8;
-  x |= x >> 16;
-  return ++x;
+using dtype = double;
+
+size_t nxtPow2(
+    int x) {  // Obtains the next greatest power of 2 if not already a
+              // power of 2
+  if (x <= 1) return 1;
+  return 1 << (32 - __builtin_clz(x - 1));
 }
-void GetNumBlocksAndThreads(unsigned int n, int& blocks,
-                            int& threads) {  // Assuming first add. Each thread
+size_t GetNumThreads(size_t n) {
+  size_t threads = nxtPow2((n + 1) / 2);
+  return (threads > MAX_THREADS) ? MAX_THREADS
+                                 : threads;  // Assuming first add. Each thread
                                              // brings in two values from mem
-  threads = (n > MAX_THREADS * 2) ? MAX_THREADS : nxtPow2((n + 1) / 2);
-  blocks = (n + threads * 2 - 1) / (threads * 2);
+}
+size_t GetNumBlocks(size_t n, int threads) {
+  return (n + threads * 2 - 1) / (threads * 2);
 }
 
 __device__ void WarpUnroll(volatile dtype* blk_mem, unsigned int tid) {
@@ -89,21 +91,23 @@ __global__ void ReductionKernel(dtype* i_data, unsigned int n, unsigned int N) {
   if (threadIdx.x == 0) i_data[bid] = blk_mem[0];
 }
 
-dtype Reduction(dtype* i_data_h, unsigned int N) {
+dtype Reduction(dtype* i_data_h, size_t N) {
   dtype* i_data_d;
   // Move data to GPU
   cudaMalloc(&i_data_d, sizeof(dtype) * N);
   cudaMemcpy(i_data_d, i_data_h, sizeof(dtype) * N, cudaMemcpyHostToDevice);
   // Reduce
-  unsigned int n = N;
-  int threads = 0;
-  int blocks = 0;
+  size_t n = N;
+  size_t threads = 0;
+  size_t blocks = 0;
   while (n > 1) {
-    GetNumBlocksAndThreads(n, blocks, threads);
+    threads = GetNumThreads(n);
+    blocks = GetNumBlocks(n, threads);
     // Kernel launch
     dim3 grid_block(16, (blocks + 16 - 1) / 16);
     dim3 thread_block(threads, 1);
-    ReductionKernel<<<grid_block, thread_block>>>(i_data_d, n, N);
+    ReductionKernel<<<grid_block, thread_block>>>(i_data_d, (unsigned int)n,
+                                                  (unsigned int)N);
     n = blocks;  // new problem size
   }
   // Move result back
@@ -114,21 +118,12 @@ dtype Reduction(dtype* i_data_h, unsigned int N) {
   return i_data_h[0];
 }
 
-dtype CPUReduction(dtype* i_data, unsigned int N) {
-  dtype sum = 0;
-  for (int i = 0; i < N; i++) {
-    sum += i_data[i];
-  }
-  return sum;
-}
-
 int main(int argc, char** argv) {
-  unsigned int N;
-  dtype* i_data_h;
+  size_t N;
 
   // Procure arguments from user
   if (argc > 1) {
-    N = (unsigned int)atoi(argv[1]);
+    N = (size_t)atoi(argv[1]);
     printf("N = %u\n", N);
   } else {
     N = N_;
@@ -136,17 +131,14 @@ int main(int argc, char** argv) {
   }
 
   // Prepare random input
-  i_data_h = (dtype*)malloc(sizeof(dtype) * N);
-  if (!i_data_h) printf("--Malloc failed for i_data_h--\n");
+  std::vector<dtype> i_data_h(N);
   srand48(21);
-  for (int i = 0; i < N; i++) i_data_h[i] = drand48() / 100000;
+  for (size_t i = 0; i < N; i++) i_data_h[i] = drand48() / 100000;
 
   // Reduce
-  dtype ground_truth = CPUReduction(i_data_h, N);
-  dtype device_result = Reduction(i_data_h, N);
+  dtype ground_truth = std::accumulate(i_data_h.begin(), i_data_h.end(), 0.0);
+  dtype device_result = Reduction(i_data_h.data(), N);
   // Verify
   printf("device result = %f\nground  truth = %f\n", device_result,
          ground_truth);
-  // Free
-  free(i_data_h);
 }
